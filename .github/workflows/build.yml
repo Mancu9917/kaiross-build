@@ -1,0 +1,247 @@
+name: Build e rilascio
+
+# CI, immagini e deploy di Kaiross. Il codice sta nel repository privato Mancu9917/kaiross: qui si scarica a ogni run
+# con una chiave di sola lettura e nessun passo ne pubblica l'output (azioni quiet ed encrypted-log).
+#   ramo uat             → immagini uat-<commit>        → uat.kaiross.ch  (Supabase staging)
+#   ramo main o tag vX.Y.Z → immagini sha-<commit>/vX.Y.Z → app.kaiross.ch (Supabase main)
+# Avvio: repository_dispatch «kaiross» dal repository privato (a ogni push su uat, main o tag) oppure a mano.
+on:
+  repository_dispatch:
+    types: [kaiross]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ramo (uat, main) o tag (vX.Y.Z) del repository privato"
+        required: true
+
+run-name: ${{ github.event.client_payload.ref_name || inputs.ref }}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  NODE_VERSION: "26"
+  NPM_VERSION: "11.19.1"
+
+jobs:
+  prepare:
+    name: Versione
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.t.outputs.sha }}
+      tag: ${{ steps.t.outputs.tag }}
+      env: ${{ steps.t.outputs.env }}
+      domain: ${{ steps.t.outputs.domain }}
+      floating: ${{ steps.t.outputs.floating }}
+      supabase_url: ${{ steps.t.outputs.supabase_url }}
+    steps:
+      - id: t
+        env:
+          KEY: ${{ secrets.KAIROSS_READ_KEY }}
+          REF: ${{ github.event.client_payload.ref_name || inputs.ref }}
+          SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set +x
+          case "$REF" in uat|main|v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "::error::ref non ammesso: $REF"; exit 1 ;; esac
+          case "$REF" in *[!a-zA-Z0-9._-]*) echo "::error::ref non valido"; exit 1 ;; esac
+          if [ -z "$SHA" ]; then
+            install -m 700 -d ~/.ssh; printf '%s\n' "$KEY" > ~/.ssh/k && chmod 600 ~/.ssh/k
+            echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+            SHA=$(GIT_SSH_COMMAND="ssh -i $HOME/.ssh/k -o IdentitiesOnly=yes" git ls-remote git@github.com:Mancu9917/kaiross.git "refs/heads/$REF" "refs/tags/$REF^{}" "refs/tags/$REF" 2>/dev/null | head -1 | cut -f1)
+            rm -f ~/.ssh/k
+          fi
+          case "$SHA" in [0-9a-f]*) ;; *) echo "::error::commit non trovato per $REF"; exit 1 ;; esac
+          case "$REF" in
+            uat) tag=uat-${SHA::7}; env=uat ;;
+            main) tag=sha-${SHA::7}; env=production ;;
+            *) tag=$REF; env=production ;;
+          esac
+          if [ "$env" = uat ]; then
+            domain=uat.kaiross.ch; floating=uat; url=https://rzahyqwgfubvzhxhhqzt.supabase.co
+          else
+            domain=app.kaiross.ch; floating=main; url=https://ozzzukhygejueiwpupfp.supabase.co
+          fi
+          [ "$REF" = main ] || [ "$REF" = uat ] || floating=""
+          { echo "sha=$SHA"; echo "tag=$tag"; echo "env=$env"; echo "domain=$domain"; echo "floating=$floating"; echo "supabase_url=$url"; } >> "$GITHUB_OUTPUT"
+          echo "$REF → $tag ($env)"
+
+  node:
+    name: Controlli e test (Node)
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/private-checkout
+        with:
+          sha: ${{ needs.prepare.outputs.sha }}
+          ssh-key: ${{ secrets.KAIROSS_READ_KEY }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+      - uses: ./.github/actions/quiet
+        with: { name: "npm ${{ env.NPM_VERSION }}", run: "npm install -g npm@${{ env.NPM_VERSION }} --no-audit --no-fund" }
+      - uses: ./.github/actions/quiet
+        with: { name: Dipendenze, run: npm ci --no-audit --no-fund }
+      - uses: ./.github/actions/quiet
+        with: { name: npm audit (produzione), run: node scripts/audit-prod.ts }
+      - uses: ./.github/actions/quiet
+        with: { name: Convenzioni di codice, run: npm run check:code }
+      - uses: ./.github/actions/quiet
+        with: { name: Typecheck script, run: npx tsc -p libs/contracts && npm run typecheck:scripts }
+      # Valori segnaposto (come nella CI del repository privato): environment del frontend e ambiente dei test del backend.
+      - uses: ./.github/actions/quiet
+        with:
+          name: Environment di prova
+          run: printf '%s\n' SUPABASE_URL=https://ci.supabase.invalid SUPABASE_ANON_KEY=ci-anon SUPABASE_SERVICE_ROLE_KEY=ci-service DATABASE_URL=postgres://ci:ci@127.0.0.1:5432/ci API_URL=http://localhost:8788 > .env.ci
+      - uses: ./.github/actions/quiet
+        with: { name: Typecheck, run: KAIROSS_ENV=.env.ci npx tsc -p libs/contracts --noEmit && KAIROSS_ENV=.env.ci npm run typecheck }
+      - uses: ./.github/actions/quiet
+        with: { name: Build, run: KAIROSS_ENV=.env.ci npm run build }
+      - uses: ./.github/actions/quiet
+        with: { name: Test backend, run: KAIROSS_ENV=.env.ci npm run -s test:unit -w @kaiross/backend }
+      - uses: ./.github/actions/quiet
+        with: { name: Test frontend e widget, run: KAIROSS_ENV=.env.ci npm test -w @kaiross/frontend -- --watch=false && KAIROSS_ENV=.env.ci npm test -w @kaiross/widget }
+      - if: failure()
+        uses: ./.github/actions/encrypted-log
+        with: { name: log-node }
+
+  ingest:
+    name: Ingest (Python)
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/private-checkout
+        with:
+          sha: ${{ needs.prepare.outputs.sha }}
+          ssh-key: ${{ secrets.KAIROSS_READ_KEY }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: src/backend/ingest/pyproject.toml
+      - uses: ./.github/actions/quiet
+        with:
+          name: Installa e importa
+          working-directory: backend/ingest
+          run: |
+            pip install ".[tests]"
+            python -m compileall -q src
+            PYTHONPATH=src python -c "import kaiross_ingest.main, kaiross_ingest.pipeline, kaiross_ingest.quality, kaiross_ingest.languages, kaiross_ingest.monitoring"
+      - uses: ./.github/actions/quiet
+        with: { name: Test, working-directory: backend/ingest, run: PYTHONPATH=src python -m unittest discover -s tests }
+      - if: failure()
+        uses: ./.github/actions/encrypted-log
+        with: { name: log-ingest }
+
+  # Build e push (una volta sola, dopo i test). Cache degli strati nelle stesse immagini private di ghcr (tag
+  # buildcache-…), non nella cache di GitHub Actions.
+  image:
+    name: Immagine ${{ matrix.image.name }}
+    needs: [prepare, node, ingest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - { name: api, file: backend/api/Dockerfile }
+          - { name: web, file: frontend/app/Dockerfile }
+          - { name: ingest, file: backend/ingest/Dockerfile }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/private-checkout
+        with:
+          sha: ${{ needs.prepare.outputs.sha }}
+          ssh-key: ${{ secrets.KAIROSS_READ_KEY }}
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/quiet
+        env:
+          NAME: ${{ matrix.image.name }}
+          FILE: ${{ matrix.image.file }}
+          ENV_NAME: ${{ needs.prepare.outputs.env }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          FLOATING: ${{ needs.prepare.outputs.floating }}
+          SUPABASE_URL: ${{ needs.prepare.outputs.supabase_url }}
+          SENTRY_DSN: ${{ vars.WEB_SENTRY_DSN }}
+        with:
+          name: Build e push
+          run: |
+            img=ghcr.io/mancu9917/kaiross-$NAME
+            tags=(-t "$img:$TAG"); [ -n "$FLOATING" ] && tags+=(-t "$img:$FLOATING")
+            cache=$img:buildcache; args=(--build-arg "KAIROSS_VERSION=$TAG")
+            if [ "$NAME" = web ]; then
+              cache=$img:buildcache-$ENV_NAME
+              # Chiave pubblica di Supabase dell'ambiente (finisce nel bundle del browser).
+              if [ "$ENV_NAME" = uat ]; then key=sb_publishable_z6GwI3ssQAMqI9ReqmcclA_haPHMq2e; else key=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im96enp1a2h5Z2VqdWVpd3B1cGZwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA1Mzg4MjksImV4cCI6MjEwNjExNDgyOX0.AFnbgj4okMkugVslRsfG2csqrprWltbsiyFv-fr5PGs; fi
+              # Chunk della versione installata nello stesso ambiente da tenere nell'immagine (alla prima build non c'è).
+              prev=scratch; docker manifest inspect "$img:${FLOATING:-main}" >/dev/null 2>&1 && prev=$img:${FLOATING:-main}
+              args+=(--build-arg "SUPABASE_URL=$SUPABASE_URL" --build-arg "SUPABASE_ANON_KEY=$key" --build-arg "SENTRY_DSN=$SENTRY_DSN"
+                --build-arg "SENTRY_ENVIRONMENT=$ENV_NAME" --build-arg "PREVIOUS_WEB_IMAGE=$prev")
+            fi
+            docker buildx build --platform linux/amd64 --progress=plain --push -f "$FILE" "${tags[@]}" "${args[@]}" \
+              --label "org.opencontainers.image.title=kaiross-$NAME" \
+              --cache-from "type=registry,ref=$cache" --cache-to "type=registry,ref=$cache,mode=max,image-manifest=true" .
+      # L'API parte e risponde su /health (liveness: non serve un database).
+      - if: matrix.image.name == 'api'
+        uses: ./.github/actions/quiet
+        with:
+          name: Avvio del container API
+          run: |
+            docker run -d --name api -p 8788:8788 \
+              -e SUPABASE_URL=https://ci.supabase.invalid -e SUPABASE_ANON_KEY=ci-anon -e SUPABASE_SERVICE_ROLE_KEY=ci-service \
+              -e DATABASE_URL=postgresql://ci:ci@127.0.0.1:5432/ci -e WEB_ORIGIN=https://ci.invalid -e WORKER_PUBLIC_URL=https://ci.invalid/api -e RATE_LIMIT_STORE=postgres \
+              -e OAUTH_STATE_SECRET=ci-oauth-state-secret-0123456789abcdef -e PYODIDE_AUTOFETCH=0 \
+              ghcr.io/mancu9917/kaiross-api:${{ needs.prepare.outputs.tag }}
+            for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8788/health && exit 0; sleep 2; done
+            docker logs api; exit 1
+      - if: failure()
+        uses: ./.github/actions/encrypted-log
+        with: { name: "log-image-${{ matrix.image.name }}" }
+
+  # Deploy sul server: la chiave può eseguire solo /srv/kaiross/deploy/remote-deploy.sh (comando forzato), che sceglie lo
+  # stack dal tag (uat-… → /srv/kaiross-uat), controlla la salute e in caso di errore torna al tag precedente.
+  deploy:
+    name: Deploy su ${{ needs.prepare.outputs.domain }}
+    needs: [prepare, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: deploy-${{ needs.prepare.outputs.env }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ needs.prepare.outputs.env }}
+      url: https://${{ needs.prepare.outputs.domain }}
+    steps:
+      - name: Deploy sul server
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +x
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          if printf '%s' "$GHCR_TOKEN" | ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "root@$SSH_HOST" "$TAG" > /tmp/deploy.log 2>&1; then
+            grep -E '^deploy (riuscito|kaiross)' /tmp/deploy.log || true
+          else
+            grep -E '^(deploy|tag non valido|un altro deploy|ripristinato|ATTENZIONE)' /tmp/deploy.log; exit 1
+          fi
+      - name: Controllo dall'esterno
+        env:
+          DOMAIN: ${{ needs.prepare.outputs.domain }}
+        run: curl -fsS -o /dev/null --retry 10 --retry-delay 6 --retry-all-errors "https://$DOMAIN/api/health/ready" && echo "https://$DOMAIN pronto"

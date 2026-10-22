@@ -1,0 +1,33 @@
+name: Passo muto
+description: >-
+  Esegue un comando in src/ senza pubblicarne l'output: nel log solo «ok» o «non riuscito». In caso di errore l'output
+  finisce in $RUNNER_TEMP/failed.log, che il job pubblica cifrato (azione encrypted-log).
+inputs:
+  name:
+    description: Nome del passo (nel log)
+    required: true
+  run:
+    description: Comando bash
+    required: true
+  working-directory:
+    description: Cartella relativa a src/
+    default: "."
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        STEP_NAME: ${{ inputs.name }}
+        CMD: ${{ inputs.run }}
+        WD: src/${{ inputs.working-directory }}
+      run: |
+        set +x
+        log=$(mktemp -p "$RUNNER_TEMP")
+        start=$(date +%s)
+        if (cd "$WD" && bash -eo pipefail -c "$CMD") > "$log" 2>&1; then
+          echo "ok: $STEP_NAME ($(( $(date +%s) - start )) s)"
+        else
+          { echo "=== $STEP_NAME"; cat "$log"; } >> "$RUNNER_TEMP/failed.log"
+          echo "::error::$STEP_NAME: non riuscito (log cifrato negli artifact del run)"
+          exit 1
+        fi

@@ -1,0 +1,23 @@
+name: Log cifrato
+description: >-
+  Se un passo muto è fallito, pubblica il suo output come artifact cifrato con logs-cert.pem (CMS, AES-256): si apre
+  solo con la chiave privata che non sta in questo repository.
+inputs:
+  name:
+    description: Nome dell'artifact
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        if [ -s "$RUNNER_TEMP/failed.log" ]; then
+          openssl cms -encrypt -binary -aes256 -in "$RUNNER_TEMP/failed.log" -outform DER -out "$RUNNER_TEMP/failed.log.p7m" logs-cert.pem
+          rm -f "$RUNNER_TEMP/failed.log"
+        fi
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ runner.temp }}/failed.log.p7m
+        if-no-files-found: ignore
+        retention-days: 7
