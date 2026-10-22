@@ -1,0 +1,59 @@
+name: Controllo dei commit
+
+# Ogni 5 minuti: ultimo commit di uat, main e dei tag vX.Y.Z del repository privato (solo gli id, con la chiave di sola
+# lettura). Per ogni commit che non ha ancora avuto una build (run-name «<ref> <commit>» di build.yml, finita o in
+# corso) e senza immagini su ghcr avvia build.yml. Il repository privato non esegue niente.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  packages: read
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: Commit da costruire
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          KEY: ${{ secrets.KAIROSS_READ_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          # Tag da costruire: da questa versione in poi (i precedenti hanno già le immagini).
+          FIRST_TAG: v0.31.0
+        run: |
+          set +x
+          install -m 700 -d ~/.ssh; printf '%s\n' "$KEY" > ~/.ssh/k && chmod 600 ~/.ssh/k
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+          refs=$(GIT_SSH_COMMAND="ssh -i $HOME/.ssh/k -o IdentitiesOnly=yes" git ls-remote git@github.com:Mancu9917/kaiross.git 'refs/heads/uat' 'refs/heads/main' 'refs/tags/v*' 2>/dev/null) || { echo "::error::lettura del repository privato non riuscita"; exit 1; }
+          rm -f ~/.ssh/k
+          # Commit dei tag annotati (^{}) al posto dell'oggetto tag; ramo o tag → commit.
+          targets=$(echo "$refs" | awk '{sub("refs/heads/","",$2); sub("refs/tags/","",$2); if ($2 ~ /\^\{\}$/) {sub(/\^\{\}$/,"",$2); peeled[$2]=$1} else if (!($2 in plain)) plain[$2]=$1}
+            END {for (r in plain) print r, (r in peeled ? peeled[r] : plain[r])}')
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null 2>&1 || true
+          done=$(gh run list --workflow build.yml --limit 200 --json displayTitle --jq '.[].displayTitle')
+          echo "$targets" | while read -r ref sha; do
+            [ -n "$ref" ] || continue
+            case "$ref" in
+              uat|main) ;;
+              v[0-9]*.[0-9]*.[0-9]*) [ "$(printf '%s\n%s\n' "$FIRST_TAG" "$ref" | sort -V | head -1)" = "$FIRST_TAG" ] || continue ;;
+              *) continue ;;
+            esac
+            case "$ref" in uat) tag=uat-${sha::7} ;; main) tag=sha-${sha::7} ;; *) tag=$ref ;; esac
+            if echo "$done" | grep -qx "$ref $sha"; then
+              echo "$ref ${sha::7}: già costruito"
+            elif docker manifest inspect "ghcr.io/mancu9917/kaiross-api:$tag" >/dev/null 2>&1; then
+              echo "$ref ${sha::7}: immagini già presenti ($tag)"
+            else
+              echo "$ref ${sha::7}: avvio la build"
+              gh workflow run build.yml -f ref="$ref" -f sha="$sha"
+            fi
+          done

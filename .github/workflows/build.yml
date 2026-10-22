@@ -4,7 +4,7 @@ name: Build e rilascio
 # con una chiave di sola lettura e nessun passo ne pubblica l'output (azioni quiet ed encrypted-log).
 #   ramo uat             → immagini uat-<commit>        → uat.kaiross.ch  (Supabase staging)
 #   ramo main o tag vX.Y.Z → immagini sha-<commit>/vX.Y.Z → app.kaiross.ch (Supabase main)
-# Avvio: repository_dispatch «kaiross» dal repository privato (a ogni push su uat, main o tag) oppure a mano.
+# Avvio: watch.yml (ogni 5 minuti, quando su uat, main o un tag c'è un commit non ancora costruito) oppure a mano.
 on:
   repository_dispatch:
     types: [kaiross]
@@ -13,8 +13,11 @@ on:
       ref:
         description: "Ramo (uat, main) o tag (vX.Y.Z) del repository privato"
         required: true
+      sha:
+        description: "Commit (facoltativo: senza, l'ultimo del ramo o del tag)"
+        required: false
 
-run-name: ${{ github.event.client_payload.ref_name || inputs.ref }}
+run-name: ${{ github.event.client_payload.ref_name || inputs.ref }} ${{ github.event.client_payload.sha || inputs.sha }}
 
 permissions:
   contents: read
@@ -41,7 +44,7 @@ jobs:
         env:
           KEY: ${{ secrets.KAIROSS_READ_KEY }}
           REF: ${{ github.event.client_payload.ref_name || inputs.ref }}
-          SHA: ${{ github.event.client_payload.sha }}
+          SHA: ${{ github.event.client_payload.sha || inputs.sha }}
         run: |
           set +x
           case "$REF" in uat|main|v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "::error::ref non ammesso: $REF"; exit 1 ;; esac
