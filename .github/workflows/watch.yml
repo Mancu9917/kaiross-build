@@ -28,7 +28,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           # Tag da costruire: da questa versione in poi (i precedenti hanno già le immagini).
-          FIRST_TAG: v0.31.0
+          FIRST_TAG: v0.31.1
         run: |
           set +x
           install -m 700 -d ~/.ssh; printf '%s\n' "$KEY" > ~/.ssh/k && chmod 600 ~/.ssh/k
