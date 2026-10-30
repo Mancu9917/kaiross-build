@@ -3,6 +3,7 @@ name: Controllo dei commit
 # Ogni 5 minuti: ultimo commit di uat, main e dei tag vX.Y.Z del repository privato (solo gli id, con la chiave di sola
 # lettura). Per ogni commit che non ha ancora avuto una build (run-name «<ref> <commit>» di build.yml, finita o in
 # corso) e senza immagini su ghcr avvia build.yml. Il repository privato non esegue niente.
+# Stesso controllo per main della landing (Mancu9917/kaiross_landing, run-name «landing <commit>» di landing.yml).
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -57,3 +58,25 @@ jobs:
               gh workflow run build.yml -f ref="$ref" -f sha="$sha"
             fi
           done
+      - name: Landing
+        if: always()
+        env:
+          KEY: ${{ secrets.LANDING_READ_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set +x
+          install -m 700 -d ~/.ssh; printf '%s\n' "$KEY" > ~/.ssh/l && chmod 600 ~/.ssh/l
+          grep -q '^github.com ssh-ed25519' ~/.ssh/known_hosts 2>/dev/null || echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+          sha=$(GIT_SSH_COMMAND="ssh -i $HOME/.ssh/l -o IdentitiesOnly=yes" git ls-remote git@github.com:Mancu9917/kaiross_landing.git refs/heads/main 2>/dev/null | cut -f1) || true
+          rm -f ~/.ssh/l
+          case "$sha" in [0-9a-f]*) ;; *) echo "::warning::lettura del repository della landing non riuscita"; exit 0 ;; esac
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null 2>&1 || true
+          if gh run list --workflow landing.yml --limit 100 --json displayTitle --jq '.[].displayTitle' | grep -qx "landing $sha"; then
+            echo "landing ${sha::7}: già costruita"
+          elif docker manifest inspect "ghcr.io/mancu9917/kaiross-landing:sha-${sha::7}" >/dev/null 2>&1; then
+            echo "landing ${sha::7}: immagine già presente"
+          else
+            echo "landing ${sha::7}: avvio la build"
+            gh workflow run landing.yml -f sha="$sha"
+          fi

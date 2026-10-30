@@ -1,0 +1,152 @@
+name: Landing
+
+# CI, immagine e deploy del sito kaiross.ch. Il codice sta nel repository privato Mancu9917/kaiross_landing: qui si
+# scarica a ogni run con una chiave di sola lettura (LANDING_READ_KEY) e nessun passo ne pubblica l'output.
+#   ramo main → immagine ghcr.io/mancu9917/kaiross-landing:sha-<commit> (e :main) → kaiross.ch
+# Avvio: watch.yml (ogni 5 minuti, quando su main c'è un commit non ancora costruito) oppure a mano.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit (facoltativo: senza, l'ultimo di main)"
+        required: false
+
+run-name: landing ${{ inputs.sha }}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  NODE_VERSION: "24"
+  NPM_VERSION: "11.19.1"
+
+jobs:
+  prepare:
+    name: Versione
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.t.outputs.sha }}
+      tag: ${{ steps.t.outputs.tag }}
+    steps:
+      - id: t
+        env:
+          KEY: ${{ secrets.LANDING_READ_KEY }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          set +x
+          if [ -z "$SHA" ]; then
+            install -m 700 -d ~/.ssh; printf '%s\n' "$KEY" > ~/.ssh/k && chmod 600 ~/.ssh/k
+            echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+            SHA=$(GIT_SSH_COMMAND="ssh -i $HOME/.ssh/k -o IdentitiesOnly=yes" git ls-remote git@github.com:Mancu9917/kaiross_landing.git refs/heads/main 2>/dev/null | cut -f1)
+            rm -f ~/.ssh/k
+          fi
+          case "$SHA" in [0-9a-f]*) ;; *) echo "::error::commit non trovato"; exit 1 ;; esac
+          case "$SHA" in *[!0-9a-f]*) echo "::error::commit non valido"; exit 1 ;; esac
+          { echo "sha=$SHA"; echo "tag=sha-${SHA::7}"; } >> "$GITHUB_OUTPUT"
+          echo "main → sha-${SHA::7}"
+
+  # Stessi controlli della CI che stava nel repository della landing: convenzioni, test, build, link e CSP, Lighthouse.
+  ci:
+    name: Controlli, test, build, Lighthouse
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/private-checkout
+        with:
+          repo: Mancu9917/kaiross_landing
+          sha: ${{ needs.prepare.outputs.sha }}
+          ssh-key: ${{ secrets.LANDING_READ_KEY }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+      - uses: ./.github/actions/quiet
+        with: { name: "npm ${{ env.NPM_VERSION }}", run: "npm install -g npm@${{ env.NPM_VERSION }} --no-audit --no-fund" }
+      - uses: ./.github/actions/quiet
+        with: { name: Dipendenze, run: npm ci --no-audit --no-fund }
+      - uses: ./.github/actions/quiet
+        with: { name: npm audit, run: npm audit --audit-level=high }
+      - uses: ./.github/actions/quiet
+        with: { name: Controlli, run: npm run check }
+      - uses: ./.github/actions/quiet
+        with: { name: Test, run: npm test }
+      - uses: ./.github/actions/quiet
+        with: { name: Build, run: npm run build }
+      - uses: ./.github/actions/quiet
+        with: { name: Link e CSP del sito generato, run: npm run check:dist }
+      - uses: ./.github/actions/quiet
+        with: { name: Lighthouse CI, run: npx --yes @lhci/cli@0.15.1 autorun }
+      - if: failure()
+        uses: ./.github/actions/encrypted-log
+        with: { name: log-landing-ci }
+
+  image:
+    name: Immagine landing
+    needs: [prepare, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/private-checkout
+        with:
+          repo: Mancu9917/kaiross_landing
+          sha: ${{ needs.prepare.outputs.sha }}
+          ssh-key: ${{ secrets.LANDING_READ_KEY }}
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/quiet
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        with:
+          name: Build e push
+          run: |
+            img=ghcr.io/mancu9917/kaiross-landing
+            docker buildx build --platform linux/amd64 --progress=plain --push -t "$img:$TAG" -t "$img:main" \
+              --label "org.opencontainers.image.title=kaiross-landing" \
+              --cache-from "type=registry,ref=$img:buildcache" --cache-to "type=registry,ref=$img:buildcache,mode=max,image-manifest=true" .
+      - if: failure()
+        uses: ./.github/actions/encrypted-log
+        with: { name: log-landing-image }
+
+  # La chiave può eseguire solo /srv/kaiross/deploy/remote-deploy-landing.sh (comando forzato): installa il tag, controlla
+  # che la landing sia sana, altrimenti torna al tag precedente. Non tocca l'app.
+  deploy:
+    name: Deploy su kaiross.ch
+    needs: [prepare, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: deploy-landing
+      cancel-in-progress: false
+    environment:
+      name: landing
+      url: https://kaiross.ch
+    steps:
+      - name: Deploy sul server
+        env:
+          SSH_KEY: ${{ secrets.LANDING_DEPLOY_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +x
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          if printf '%s' "$GHCR_TOKEN" | ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "root@$SSH_HOST" "$TAG" > /tmp/deploy.log 2>&1; then
+            grep -E '^deploy landing' /tmp/deploy.log || true
+          else
+            grep -E '^(deploy|tag non valido|un altro deploy|in servizio|ripristinato|ATTENZIONE)' /tmp/deploy.log; exit 1
+          fi
+      - name: Controllo dall'esterno
+        run: curl -fsS -o /dev/null --retry 10 --retry-delay 6 --retry-all-errors https://kaiross.ch && echo "https://kaiross.ch pronto"
