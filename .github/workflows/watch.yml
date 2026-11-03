@@ -3,7 +3,7 @@ name: Controllo dei commit
 # Ogni 5 minuti: ultimo commit di uat, main e dei tag vX.Y.Z del repository privato (solo gli id, con la chiave di sola
 # lettura). Per ogni commit che non ha ancora avuto una build (run-name «<ref> <commit>» di build.yml, finita o in
 # corso) e senza immagini su ghcr avvia build.yml. Il repository privato non esegue niente.
-# Stesso controllo per main della landing (Mancu9917/kaiross_landing, run-name «landing <commit>» di landing.yml).
+# Landing: coppia main landing/main app, per rigenerare la guida anche senza modifiche al sito.
 # Backoffice separato su uat/main: backoffice.yml verifica prima che il manifest dell'app sia presente.
 on:
   schedule:
@@ -63,23 +63,32 @@ jobs:
         if: always()
         env:
           KEY: ${{ secrets.LANDING_READ_KEY }}
+          APP_KEY: ${{ secrets.KAIROSS_READ_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           set +x
-          install -m 700 -d ~/.ssh; printf '%s\n' "$KEY" > ~/.ssh/l && chmod 600 ~/.ssh/l
+          install -m 700 -d ~/.ssh
+          key=$(mktemp ~/.ssh/landing-watch.XXXXXX)
+          trap 'rm -f "$key"' EXIT
           grep -q '^github.com ssh-ed25519' ~/.ssh/known_hosts 2>/dev/null || echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
-          sha=$(GIT_SSH_COMMAND="ssh -i $HOME/.ssh/l -o IdentitiesOnly=yes" git ls-remote git@github.com:Mancu9917/kaiross_landing.git refs/heads/main 2>/dev/null | cut -f1) || true
-          rm -f ~/.ssh/l
-          case "$sha" in [0-9a-f]*) ;; *) echo "::warning::lettura del repository della landing non riuscita"; exit 0 ;; esac
+          resolve_main() {
+            printf '%s\n' "$1" > "$key"; chmod 600 "$key"
+            GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" \
+              git ls-remote "git@github.com:Mancu9917/$2.git" refs/heads/main 2>/dev/null | cut -f1
+          }
+          sha=$(resolve_main "$KEY" kaiross_landing) || { echo "::warning::lettura del main landing non riuscita"; exit 0; }
+          app_sha=$(resolve_main "$APP_KEY" kaiross) || { echo "::warning::lettura del main app non riuscita"; exit 0; }
+          [[ "$sha" =~ ^[0-9a-f]{40}$ && "$app_sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::warning::lettura dei main landing/app non riuscita'; exit 0; }
+          tag=sha-${sha::7}-app-${app_sha::7}
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null 2>&1 || true
-          if gh run list --workflow landing.yml --limit 100 --json displayTitle --jq '.[].displayTitle' | grep -qx "landing $sha"; then
-            echo "landing ${sha::7}: già costruita"
-          elif docker manifest inspect "ghcr.io/mancu9917/kaiross-landing:sha-${sha::7}" >/dev/null 2>&1; then
-            echo "landing ${sha::7}: immagine già presente"
+          if gh run list --workflow landing.yml --limit 100 --json displayTitle --jq '.[].displayTitle' | grep -qxF "landing $sha guide $app_sha"; then
+            echo "landing ${sha::7}, main app ${app_sha::7}: già esaminati"
+          elif docker manifest inspect "ghcr.io/mancu9917/kaiross-landing:$tag" >/dev/null 2>&1; then
+            echo "landing ${sha::7}, main app ${app_sha::7}: immagine già presente"
           else
-            echo "landing ${sha::7}: avvio la build"
-            gh workflow run landing.yml -f sha="$sha"
+            echo "landing ${sha::7}, main app ${app_sha::7}: avvio la build"
+            gh workflow run landing.yml -f sha="$sha" -f app_sha="$app_sha"
           fi
       - name: Backoffice
         if: always()

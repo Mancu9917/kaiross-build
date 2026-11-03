@@ -2,16 +2,19 @@ name: Landing
 
 # CI, immagine e deploy del sito kaiross.ch. Il codice sta nel repository privato Mancu9917/kaiross_landing: qui si
 # scarica a ogni run con una chiave di sola lettura (LANDING_READ_KEY) e nessun passo ne pubblica l'output.
-#   ramo main → immagine ghcr.io/mancu9917/kaiross-landing:sha-<commit> (e :main) → kaiross.ch
-# Avvio: watch.yml (ogni 5 minuti, quando su main c'è un commit non ancora costruito) oppure a mano.
+#   main landing + main app → kaiross-landing:sha-<landing7>-app-<app7> (e :main) → kaiross.ch
+# Avvio: watch.yml quando cambia il main della landing o dell'app; sempre una coppia di commit fissata.
 on:
   workflow_dispatch:
     inputs:
       sha:
         description: "Commit (facoltativo: senza, l'ultimo di main)"
         required: false
+      app_sha:
+        description: "Commit già su main dell'app per la guida (facoltativo: ultimo main)"
+        required: false
 
-run-name: landing ${{ inputs.sha }}
+run-name: landing ${{ inputs.sha }} guide ${{ inputs.app_sha }}
 
 permissions:
   contents: read
@@ -29,23 +32,30 @@ jobs:
     outputs:
       sha: ${{ steps.t.outputs.sha }}
       tag: ${{ steps.t.outputs.tag }}
+      app_sha: ${{ steps.t.outputs.app_sha }}
     steps:
       - id: t
         env:
           KEY: ${{ secrets.LANDING_READ_KEY }}
           SHA: ${{ inputs.sha }}
+          APP_SHA: ${{ inputs.app_sha }}
+          APP_KEY: ${{ secrets.KAIROSS_READ_KEY }}
         run: |
           set +x
-          if [ -z "$SHA" ]; then
-            install -m 700 -d ~/.ssh; printf '%s\n' "$KEY" > ~/.ssh/k && chmod 600 ~/.ssh/k
-            echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
-            SHA=$(GIT_SSH_COMMAND="ssh -i $HOME/.ssh/k -o IdentitiesOnly=yes" git ls-remote git@github.com:Mancu9917/kaiross_landing.git refs/heads/main 2>/dev/null | cut -f1)
-            rm -f ~/.ssh/k
-          fi
-          case "$SHA" in [0-9a-f]*) ;; *) echo "::error::commit non trovato"; exit 1 ;; esac
-          case "$SHA" in *[!0-9a-f]*) echo "::error::commit non valido"; exit 1 ;; esac
-          { echo "sha=$SHA"; echo "tag=sha-${SHA::7}"; } >> "$GITHUB_OUTPUT"
-          echo "main → sha-${SHA::7}"
+          install -m 700 -d ~/.ssh
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+          key=$(mktemp ~/.ssh/landing-read.XXXXXX)
+          trap 'rm -f "$key"' EXIT
+          resolve_main() {
+            printf '%s\n' "$1" > "$key"; chmod 600 "$key"
+            GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" \
+              git ls-remote "git@github.com:Mancu9917/$2.git" refs/heads/main 2>/dev/null | cut -f1
+          }
+          [ -n "$SHA" ] || SHA=$(resolve_main "$KEY" kaiross_landing)
+          [ -n "$APP_SHA" ] || APP_SHA=$(resolve_main "$APP_KEY" kaiross)
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ && "$APP_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit non validi o non trovati"; exit 1; }
+          { echo "sha=$SHA"; echo "app_sha=$APP_SHA"; echo "tag=sha-${SHA::7}-app-${APP_SHA::7}"; } >> "$GITHUB_OUTPUT"
+          echo "landing ${SHA::7}, main app ${APP_SHA::7}"
 
   # Stessi controlli della CI che stava nel repository della landing: convenzioni, test, build, link e CSP, Lighthouse.
   ci:
@@ -60,6 +70,14 @@ jobs:
           repo: Mancu9917/kaiross_landing
           sha: ${{ needs.prepare.outputs.sha }}
           ssh-key: ${{ secrets.LANDING_READ_KEY }}
+      # Storico completo e commit già approvato su main: serve anche per le date dei capitoli.
+      - uses: ./.github/actions/private-checkout
+        with:
+          sha: ${{ needs.prepare.outputs.app_sha }}
+          ssh-key: ${{ secrets.KAIROSS_READ_KEY }}
+          path: app
+          fetch-depth: "0"
+          verify-main: "true"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -71,6 +89,12 @@ jobs:
         with: { name: Dipendenze, run: npm ci --no-audit --no-fund }
       - uses: ./.github/actions/quiet
         with: { name: npm audit, run: npm audit --audit-level=high }
+      - uses: ./.github/actions/quiet
+        env:
+          APP_SHA: ${{ needs.prepare.outputs.app_sha }}
+        with:
+          name: Sincronizzazione guida da main
+          run: node ../.github/scripts/sync-landing-guide.ts --landing . --app ../app --sha "$APP_SHA"
       - uses: ./.github/actions/quiet
         with: { name: Controlli, run: npm run check }
       - uses: ./.github/actions/quiet
@@ -97,6 +121,29 @@ jobs:
           repo: Mancu9917/kaiross_landing
           sha: ${{ needs.prepare.outputs.sha }}
           ssh-key: ${{ secrets.LANDING_READ_KEY }}
+      # Storico completo e commit già approvato su main: serve anche per le date dei capitoli.
+      - uses: ./.github/actions/private-checkout
+        with:
+          sha: ${{ needs.prepare.outputs.app_sha }}
+          ssh-key: ${{ secrets.KAIROSS_READ_KEY }}
+          path: app
+          fetch-depth: "0"
+          verify-main: "true"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+      - uses: ./.github/actions/quiet
+        with: { name: "npm ${{ env.NPM_VERSION }}", run: "npm install -g npm@${{ env.NPM_VERSION }} --no-audit --no-fund" }
+      - uses: ./.github/actions/quiet
+        with: { name: Dipendenze per la guida, run: npm ci --no-audit --no-fund }
+      - uses: ./.github/actions/quiet
+        env:
+          APP_SHA: ${{ needs.prepare.outputs.app_sha }}
+        with:
+          name: Sincronizzazione guida da main
+          run: node ../.github/scripts/sync-landing-guide.ts --landing . --app ../app --sha "$APP_SHA"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -106,12 +153,15 @@ jobs:
       - uses: ./.github/actions/quiet
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
+          LANDING_SHA: ${{ needs.prepare.outputs.sha }}
+          APP_SHA: ${{ needs.prepare.outputs.app_sha }}
         with:
           name: Build e push
           run: |
             img=ghcr.io/mancu9917/kaiross-landing
             docker buildx build --platform linux/amd64 --progress=plain --push -t "$img:$TAG" -t "$img:main" \
               --label "org.opencontainers.image.title=kaiross-landing" \
+              --label "org.opencontainers.image.revision=$LANDING_SHA" --label "ch.kaiross.guide.source=$APP_SHA" \
               --cache-from "type=registry,ref=$img:buildcache" --cache-to "type=registry,ref=$img:buildcache,mode=max,image-manifest=true" .
       - if: failure()
         uses: ./.github/actions/encrypted-log
@@ -150,3 +200,25 @@ jobs:
           fi
       - name: Controllo dall'esterno
         run: curl -fsS -o /dev/null --retry 10 --retry-delay 6 --retry-all-errors https://kaiross.ch && echo "https://kaiross.ch pronto"
+
+  indexnow:
+    name: Avviso ai motori di ricerca
+    needs: [prepare, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/private-checkout
+        with:
+          repo: Mancu9917/kaiross_landing
+          sha: ${{ needs.prepare.outputs.sha }}
+          ssh-key: ${{ secrets.LANDING_READ_KEY }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: ./.github/actions/quiet
+        with: { name: Avviso IndexNow, run: npm run indexnow }
+      - if: failure()
+        uses: ./.github/actions/encrypted-log
+        with: { name: log-landing-indexnow }

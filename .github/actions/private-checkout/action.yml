@@ -7,6 +7,15 @@ inputs:
   sha:
     description: Commit da scaricare
     required: true
+  path:
+    description: Cartella del checkout, un solo nome relativo
+    default: src
+  fetch-depth:
+    description: 1 per il commit, 0 per lo storico completo
+    default: "1"
+  verify-main:
+    description: Richiede che il commit appartenga al main remoto (con storico completo)
+    default: "false"
   ssh-key:
     description: Chiave di deploy in sola lettura del repository privato
     required: true
@@ -18,19 +27,36 @@ runs:
         KEY: ${{ inputs.ssh-key }}
         SHA: ${{ inputs.sha }}
         REPO: ${{ inputs.repo }}
+        DEST: ${{ inputs.path }}
+        DEPTH: ${{ inputs.fetch-depth }}
+        VERIFY_MAIN: ${{ inputs.verify-main }}
       run: |
         set +x
-        case "$SHA" in *[!0-9a-f]*|"") echo "::error::commit non valido"; exit 1 ;; esac
         case "$REPO" in Mancu9917/kaiross|Mancu9917/kaiross_landing) ;; *) echo "::error::repository non ammesso"; exit 1 ;; esac
+        [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit non valido"; exit 1; }
+        [[ "$DEST" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || { echo "::error::cartella non valida"; exit 1; }
+        case "$DEPTH:$VERIFY_MAIN" in 1:false|0:false|0:true) ;; *) echo "::error::opzioni storico non valide"; exit 1 ;; esac
         install -m 700 -d ~/.ssh
-        printf '%s\n' "$KEY" > ~/.ssh/kaiross_read && chmod 600 ~/.ssh/kaiross_read
-        # Chiave pubblica di github.com (https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)
+        key=$(mktemp ~/.ssh/kaiross-read.XXXXXX)
+        trap 'rm -f "$key"' EXIT
+        printf '%s\n' "$KEY" > "$key"; chmod 600 "$key"
+        # Chiave pubblica di github.com, pin esistente del progetto.
         echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
-        export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/kaiross_read -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
-        if git init -q src && git -C src remote add origin git@github.com:$REPO.git \
-          && git -C src fetch -q --depth 1 origin "$SHA" >/dev/null 2>&1 && git -C src checkout -q FETCH_HEAD >/dev/null 2>&1; then
+        export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+        checkout_private() {
+          git init -q "$DEST" && git -C "$DEST" remote add origin "git@github.com:$REPO.git" || return 1
+          if [ "$VERIFY_MAIN" = true ]; then
+            git -C "$DEST" fetch -q --no-tags origin refs/heads/main:refs/remotes/origin/main || return 1
+            git -C "$DEST" merge-base --is-ancestor "$SHA" refs/remotes/origin/main || return 1
+          elif [ "$DEPTH" = 0 ]; then
+            git -C "$DEST" fetch -q --no-tags origin "$SHA" || return 1
+          else
+            git -C "$DEST" fetch -q --no-tags --depth 1 origin "$SHA" || return 1
+          fi
+          git -C "$DEST" checkout -q "$SHA"
+        }
+        if checkout_private >/dev/null 2>&1; then
           echo "codice scaricato"
         else
-          echo "::error::download del codice non riuscito"; rm -f ~/.ssh/kaiross_read; exit 1
+          echo "::error::download o verifica del codice non riusciti"; exit 1
         fi
-        rm -f ~/.ssh/kaiross_read

@@ -29,3 +29,19 @@ Installazione iniziale, DNS e autorizzazioni del nuovo pacchetto GHCR vanno pred
 Il watcher non rilancia uno stesso commit già esaminato, anche se assente o fallito: per riprovare lo stesso SHA,
 avviare manualmente `backoffice.yml` scegliendo `ref` e `sha`. I rilasci BO e app dello stesso ambiente condividono
 la coda di deploy; anche lo script sul server usa il lock comune e ripristina l'immagine precedente in caso di errore.
+
+
+La pipeline landing fissa una coppia di commit: main di `kaiross_landing` e un commit già presente sul main
+approvato dell'app. Il checkout della guida include tutto lo storico Git per le date dei capitoli. La guida viene
+sincronizzata prima di controlli/test e prima della build dell'immagine; un errore in una guida presente blocca il
+rilascio. Se `guide/` non è ancora su main, il riepilogo segnala lo skip e mantiene la guida già inclusa nella
+landing. Nessun prelievo automatico dai rami UAT/BE/FE.
+
+Il watcher segue entrambi i main: anche un aggiornamento della sola app avvia il controllo della guida. Il nome del
+run è `landing <sha> guide <app_sha>` e il tag immutabile è `sha-<landing7>-app-<app7>`; le due revisioni sono anche
+nelle label dell'immagine. La pipeline manuale accetta `sha` e `app_sha` facoltativi; senza, risolve gli ultimi main.
+Il checkout rifiuta un `app_sha` non appartenente a main. Non pubblica né committa file generati nei repository.
+
+Dopo il deploy e il controllo HTTPS, il job `indexnow` scarica lo stesso commit landing e invoca `npm run indexnow`
+con Node 24, senza installare dipendenze né aggiungere segreti. Un errore IndexNow è non bloccante per il rilascio.
+Il dry-run locale (`npm run indexnow -- --dry-run`) legge la sitemap senza notificare i motori di ricerca.
