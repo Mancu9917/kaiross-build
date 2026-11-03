@@ -195,7 +195,8 @@ jobs:
     steps:
       - name: Deploy sul server
         env:
-          SSH_KEY: ${{ secrets.BACKOFFICE_DEPLOY_SSH_KEY }}
+          # Stessa chiave dell'app: remote-deploy.sh passa i tag bo-<tag> allo script del solo backoffice.
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           SSH_HOST: ${{ secrets.DEPLOY_HOST }}
           SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
           TAG: ${{ needs.prepare.outputs.tag }}
@@ -208,7 +209,7 @@ jobs:
           trap 'rm -f "$key" /tmp/backoffice-deploy.log' EXIT
           printf '%s\n' "$SSH_KEY" > "$key"; chmod 600 "$key"
           printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          if printf '%s' "$GHCR_TOKEN" | ssh -i "$key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "root@$SSH_HOST" "$TAG" > /tmp/backoffice-deploy.log 2>&1; then
+          if printf '%s' "$GHCR_TOKEN" | ssh -i "$key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "root@$SSH_HOST" "bo-$TAG" > /tmp/backoffice-deploy.log 2>&1; then
             grep -E '^deploy backoffice' /tmp/backoffice-deploy.log || true
           else
             grep -E '^(deploy|tag non valido|un altro deploy|backoffice|in servizio|ripristinato|ATTENZIONE)' /tmp/backoffice-deploy.log || true
