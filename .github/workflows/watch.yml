@@ -4,6 +4,7 @@ name: Controllo dei commit
 # lettura). Per ogni commit che non ha ancora avuto una build (run-name «<ref> <commit>» di build.yml, finita o in
 # corso) e senza immagini su ghcr avvia build.yml. Il repository privato non esegue niente.
 # Stesso controllo per main della landing (Mancu9917/kaiross_landing, run-name «landing <commit>» di landing.yml).
+# Backoffice separato su uat/main: backoffice.yml verifica prima che il manifest dell'app sia presente.
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -80,3 +81,32 @@ jobs:
             echo "landing ${sha::7}: avvio la build"
             gh workflow run landing.yml -f sha="$sha"
           fi
+      - name: Backoffice
+        if: always()
+        env:
+          KEY: ${{ secrets.KAIROSS_READ_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set +x
+          install -m 700 -d ~/.ssh
+          key=$(mktemp ~/.ssh/backoffice-watch.XXXXXX)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$KEY" > "$key"; chmod 600 "$key"
+          grep -q '^github.com ssh-ed25519' ~/.ssh/known_hosts 2>/dev/null || echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+          refs=$(GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" git ls-remote git@github.com:Mancu9917/kaiross.git refs/heads/uat refs/heads/main 2>/dev/null) || { echo '::warning::lettura del repository del backoffice non riuscita'; exit 0; }
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null 2>&1 || true
+          done=$(gh run list --workflow backoffice.yml --limit 200 --json displayTitle --jq '.[].displayTitle')
+          while read -r sha fullref; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+            ref=${fullref#refs/heads/}
+            case "$ref" in uat) tag=uat-${sha::7} ;; main) tag=sha-${sha::7} ;; *) continue ;; esac
+            if echo "$done" | grep -qxF "backoffice $ref $sha"; then
+              echo "backoffice $ref ${sha::7}: già esaminato"
+            elif docker manifest inspect "ghcr.io/mancu9917/kaiross-backoffice:$tag" >/dev/null 2>&1; then
+              echo "backoffice $ref ${sha::7}: immagine già presente"
+            else
+              echo "backoffice $ref ${sha::7}: avvio la verifica e la build se l'app è presente"
+              gh workflow run backoffice.yml -f ref="$ref" -f sha="$sha"
+            fi
+          done <<< "$refs"

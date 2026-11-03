@@ -1,0 +1,220 @@
+name: Backoffice
+
+# App Angular separata, dal repository privato Kaiross. Finché Agata non aggiunge backoffice/package.json,
+# termina con un riepilogo esplicito: nessuna installazione, immagine o modifica del server.
+#   uat  → kaiross-backoffice:uat-<commit> → backoffice-uat.kaiross.ch (Supabase staging)
+#   main → kaiross-backoffice:sha-<commit> → backoffice.kaiross.ch     (Supabase main)
+on:
+  repository_dispatch:
+    types: [kaiross-backoffice]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ramo del repository privato"
+        required: true
+        type: choice
+        options: [uat, main]
+      sha:
+        description: "Commit (facoltativo: senza, l'ultimo del ramo)"
+        required: false
+
+run-name: backoffice ${{ github.event.client_payload.ref_name || inputs.ref }} ${{ github.event.client_payload.sha || inputs.sha }}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  NODE_VERSION: "26"
+  NPM_VERSION: "11.19.1"
+
+jobs:
+  prepare:
+    name: Versione e disponibilità
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.t.outputs.sha }}
+      tag: ${{ steps.t.outputs.tag }}
+      env: ${{ steps.t.outputs.env }}
+      domain: ${{ steps.t.outputs.domain }}
+      floating: ${{ steps.t.outputs.floating }}
+      supabase_url: ${{ steps.t.outputs.supabase_url }}
+      present: ${{ steps.app.outputs.present }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: t
+        env:
+          KEY: ${{ secrets.KAIROSS_READ_KEY }}
+          REF: ${{ github.event.client_payload.ref_name || inputs.ref }}
+          SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+        run: |
+          set +x
+          case "$REF" in uat|main) ;; *) echo "::error::ramo non ammesso"; exit 1 ;; esac
+          if [ -z "$SHA" ]; then
+            install -m 700 -d ~/.ssh
+            key=$(mktemp ~/.ssh/backoffice-read.XXXXXX)
+            trap 'rm -f "$key"' EXIT
+            printf '%s\n' "$KEY" > "$key"; chmod 600 "$key"
+            echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+            SHA=$(GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" git ls-remote git@github.com:Mancu9917/kaiross.git "refs/heads/$REF" 2>/dev/null | cut -f1)
+          fi
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit non valido o non trovato"; exit 1; }
+          if [ "$REF" = uat ]; then
+            tag=uat-${SHA::7}; environment=uat; domain=backoffice-uat.kaiross.ch
+            url=https://rzahyqwgfubvzhxhhqzt.supabase.co
+          else
+            tag=sha-${SHA::7}; environment=production; domain=backoffice.kaiross.ch
+            url=https://ozzzukhygejueiwpupfp.supabase.co
+          fi
+          { echo "sha=$SHA"; echo "tag=$tag"; echo "env=$environment"; echo "domain=$domain"; echo "floating=$REF"; echo "supabase_url=$url"; } >> "$GITHUB_OUTPUT"
+          echo "backoffice $REF → $tag ($environment)"
+      - uses: ./.github/actions/private-checkout
+        with:
+          sha: ${{ steps.t.outputs.sha }}
+          ssh-key: ${{ secrets.KAIROSS_READ_KEY }}
+      - id: app
+        name: Presenza dell'app
+        run: |
+          if [ -f src/backoffice/package.json ]; then
+            echo 'present=true' >> "$GITHUB_OUTPUT"
+            echo 'Backoffice presente: controlli, immagine e deploy abilitati.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'present=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::Backoffice non ancora presente: controlli, immagine e deploy saltati.'
+            echo 'Backoffice non ancora presente (`backoffice/package.json` assente). Nessuna installazione, build o modifica del server. La pipeline si attiva automaticamente al primo nuovo commit che contiene il manifest.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  ci:
+    name: Controlli, test e build
+    needs: prepare
+    if: needs.prepare.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/private-checkout
+        with:
+          sha: ${{ needs.prepare.outputs.sha }}
+          ssh-key: ${{ secrets.KAIROSS_READ_KEY }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+      - uses: ./.github/actions/quiet
+        with: { name: "npm ${{ env.NPM_VERSION }}", run: "npm install -g npm@${{ env.NPM_VERSION }} --no-audit --no-fund" }
+      - uses: ./.github/actions/quiet
+        with: { name: Dipendenze, run: npm ci --no-audit --no-fund }
+      - uses: ./.github/actions/quiet
+        with:
+          name: Environment di prova
+          run: |
+            printf '%s\n' SUPABASE_URL=https://ci.supabase.invalid SUPABASE_ANON_KEY=ci-anon API_URL=/api > .env.ci
+            KAIROSS_ENV=.env.ci node scripts/env-backoffice.ts
+      - uses: ./.github/actions/quiet
+        with: { name: Contratti e typecheck, run: npx tsc -p libs/contracts && KAIROSS_ENV=.env.ci npm run typecheck -w ./backoffice }
+      - uses: ./.github/actions/quiet
+        with: { name: Test, run: KAIROSS_ENV=.env.ci npm test -w ./backoffice -- --watch=false }
+      - uses: ./.github/actions/quiet
+        with: { name: Build, run: KAIROSS_ENV=.env.ci npm run build -w ./backoffice }
+      - if: failure()
+        uses: ./.github/actions/encrypted-log
+        with: { name: log-backoffice-ci }
+
+  image:
+    name: Immagine backoffice
+    needs: [prepare, ci]
+    if: needs.prepare.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/private-checkout
+        with:
+          sha: ${{ needs.prepare.outputs.sha }}
+          ssh-key: ${{ secrets.KAIROSS_READ_KEY }}
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/quiet
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          ENV_NAME: ${{ needs.prepare.outputs.env }}
+          FLOATING: ${{ needs.prepare.outputs.floating }}
+          SUPABASE_URL: ${{ needs.prepare.outputs.supabase_url }}
+        with:
+          name: Build e push
+          run: |
+            img=ghcr.io/mancu9917/kaiross-backoffice
+            cache=$img:buildcache-$ENV_NAME
+            # Chiavi pubbliche degli stessi progetti Supabase usati dall'app; finiscono nel bundle del browser.
+            if [ "$ENV_NAME" = uat ]; then key=sb_publishable_z6GwI3ssQAMqI9ReqmcclA_haPHMq2e; else key=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im96enp1a2h5Z2VqdWVpd3B1cGZwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA1Mzg4MjksImV4cCI6MjEwNjExNDgyOX0.AFnbgj4okMkugVslRsfG2csqrprWltbsiyFv-fr5PGs; fi
+            prev=scratch
+            if docker manifest inspect "$img:$FLOATING" >/dev/null 2>&1; then prev=$img:$FLOATING; fi
+            docker buildx build --platform linux/amd64 --progress=plain --push -f deploy/backoffice/Dockerfile \
+              -t "$img:$TAG" -t "$img:$FLOATING" \
+              --build-arg "KAIROSS_VERSION=$TAG" --build-arg "SUPABASE_URL=$SUPABASE_URL" --build-arg "SUPABASE_ANON_KEY=$key" \
+              --build-arg "PREVIOUS_BACKOFFICE_IMAGE=$prev" \
+              --label "org.opencontainers.image.title=kaiross-backoffice" \
+              --cache-from "type=registry,ref=$cache" --cache-to "type=registry,ref=$cache,mode=max,image-manifest=true" .
+      - uses: ./.github/actions/quiet
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        with:
+          name: Avvio del container backoffice
+          run: |
+            trap 'docker rm -f backoffice >/dev/null 2>&1 || true' EXIT
+            docker run -d --name backoffice -p 8080:80 "ghcr.io/mancu9917/kaiross-backoffice:$TAG"
+            for i in $(seq 1 20); do
+              if curl -fsS http://127.0.0.1:8080/ -o /tmp/backoffice-index.html && grep -qi '<html' /tmp/backoffice-index.html; then exit 0; fi
+              sleep 2
+            done
+            docker logs backoffice; exit 1
+      - if: failure()
+        uses: ./.github/actions/encrypted-log
+        with: { name: log-backoffice-image }
+
+  # Chiave distinta, forzata a /srv/kaiross/deploy/remote-deploy-backoffice.sh. L'installazione iniziale del servizio
+  # resta esplicita: la CI aggiorna solo il container BO già predisposto, con rollback e lock condiviso con l'app.
+  deploy:
+    name: Deploy su ${{ needs.prepare.outputs.domain }}
+    needs: [prepare, image]
+    if: needs.prepare.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: deploy-${{ needs.prepare.outputs.env }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ needs.prepare.outputs.env }}
+      url: https://${{ needs.prepare.outputs.domain }}
+    steps:
+      - name: Deploy sul server
+        env:
+          SSH_KEY: ${{ secrets.BACKOFFICE_DEPLOY_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +x
+          [ -n "$SSH_KEY" ] && [ -n "$SSH_HOST" ] && [ -n "$SSH_KNOWN_HOSTS" ] || { echo '::error::configurare la chiave di deploy backoffice e il server'; exit 1; }
+          install -m 700 -d ~/.ssh
+          key=$(mktemp ~/.ssh/backoffice-deploy.XXXXXX)
+          trap 'rm -f "$key" /tmp/backoffice-deploy.log' EXIT
+          printf '%s\n' "$SSH_KEY" > "$key"; chmod 600 "$key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          if printf '%s' "$GHCR_TOKEN" | ssh -i "$key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "root@$SSH_HOST" "$TAG" > /tmp/backoffice-deploy.log 2>&1; then
+            grep -E '^deploy backoffice' /tmp/backoffice-deploy.log || true
+          else
+            grep -E '^(deploy|tag non valido|un altro deploy|backoffice|in servizio|ripristinato|ATTENZIONE)' /tmp/backoffice-deploy.log || true
+            echo '::error::deploy backoffice non riuscito'; exit 1
+          fi
+      - name: Controllo dall'esterno
+        env:
+          DOMAIN: ${{ needs.prepare.outputs.domain }}
+        run: curl -fsS -o /dev/null --retry 10 --retry-delay 6 --retry-all-errors "https://$DOMAIN/" && echo "https://$DOMAIN pronto"
