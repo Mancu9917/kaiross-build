@@ -134,7 +134,7 @@ jobs:
           name: Installa e importa
           working-directory: backend/ingest
           run: |
-            pip install ".[tests]"
+            pip install --find-links ../../vendor ".[tests]"  # SDK di Memdoria: ruota in vendor/, non su PyPI
             python -m compileall -q src
             PYTHONPATH=src python -c "import kaiross_ingest.main, kaiross_ingest.pipeline, kaiross_ingest.quality, kaiross_ingest.languages, kaiross_ingest.monitoring"
       - uses: ./.github/actions/quiet
